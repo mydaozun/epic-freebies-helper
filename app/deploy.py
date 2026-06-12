@@ -87,9 +87,6 @@ async def execute_browser_tasks(headless: bool = True):
             for p in browser.pages:
                 await p.close()
 
-        with suppress(Exception):
-            await browser.close()
-
         logger.debug("Browser tasks execution finished successfully")
 
 

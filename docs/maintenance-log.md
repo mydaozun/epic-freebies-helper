@@ -676,3 +676,22 @@
   - `Rogue Waters` 通过 `ADD TO LIBRARY` 即时结账后确认 `IN LIBRARY`。
   - `Songs of Conquest` 结账 hCaptcha 首轮失败后重试成功，验证码后标准点击被 overlay 拦截，但 force 点击推进并最终确认 `IN LIBRARY`。
   - 最终日志为 `Confirmed 2 instant claim(s)`、`Browser tasks execution finished successfully`、`Scheduler is disabled, deployment completed`，进程退出码为 0。
+
+### 2026-06-12 Camoufox 清理阶段双重关闭导致 GitHub Actions 假失败
+
+- 现象：
+  - 某些 GitHub Actions 日志里，登录、MFA 推荐页跳过、商店会话验证、甚至商品发现都已经正常完成。
+  - 但 run 最终不是死在领取状态机里，而是在退出浏览器上下文时抛出 `BrowserContext.close: Connection closed while reading from the driver`，随后整轮以 exit code 1 结束。
+  - 日志尾部还伴随多条 `Target page, context or browser has been closed` 的 future 异常。
+- 根因判断：
+  - `execute_browser_tasks()` 在 `async with open_browser_context(...)` 内部手动调用了 `await browser.close()`。
+  - 同时 `open_browser_context()` 自己也负责在退出时关闭 Camoufox / Playwright 持久化 context。
+  - 在 GitHub runner 上，一旦 Camoufox 驱动已先断开，第二次关闭会把原本应当成功或至少更准确的主异常覆盖成收尾阶段异常，造成“假失败”。
+- 改动文件：
+  - `app/deploy.py`
+  - `app/services/browser_context.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 浏览器关闭职责统一收回 `open_browser_context()`，移除了 `execute_browser_tasks()` 内部的重复 `browser.close()`。
+  - Camoufox 分支改为手动托管 `__aenter__` / `__aexit__`，并在退出时抑制关闭阶段异常，避免驱动已断开时把 run 改写成失败。
+  - 这样即使浏览器进程先一步结束，GitHub Actions 也不会因为清理阶段双重关闭而额外翻成 exit code 1。
