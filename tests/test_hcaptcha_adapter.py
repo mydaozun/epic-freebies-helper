@@ -9,8 +9,10 @@ from extensions.hcaptcha_adapter import (
     _correct_drag_source_points,
     _decode_entity_contour,
     _detect_task_canvas_origin,
+    _is_line_completion_question,
     _match_outline_contours,
     _queue_empty_checkcaptcha_response,
+    _select_line_gap_markers,
 )
 
 
@@ -125,7 +127,22 @@ def test_entity_contour_uses_png_alpha_channel():
     assert cv2.contourArea(contour) > 250
 
 
-def test_empty_checkcaptcha_response_is_queued_as_failure():
+def test_line_gap_markers_use_cyan_three_and_yellow_five():
+    markers = [
+        ((320.0, 290.0), (128.0, 104.0, 137.0)),
+        ((275.0, 220.0), (117.0, 84.0, 110.0)),
+        ((280.0, 325.0), (107.0, 79.0, 81.0)),
+        ((158.0, 243.0), (75.0, 132.0, 149.0)),
+    ]
+
+    assert _select_line_gap_markers(markers) == ((280.0, 325.0), (158.0, 243.0))
+
+
+def test_line_question_detection_tolerates_confusable_words():
+    assert _is_line_completion_question("Please ԁrag the segment on the right to сomplete the line")
+
+
+def test_empty_checkcaptcha_response_is_queued_after_grace_period():
     class Response:
         url = "https://api.hcaptcha.com/checkcaptcha/example"
         status = 200
@@ -134,11 +151,38 @@ def test_empty_checkcaptcha_response_is_queued_as_failure():
         async def body():
             return b""
 
-    agent = SimpleNamespace(_captcha_response_queue=asyncio.Queue())
+    async def scenario():
+        agent = SimpleNamespace(_captcha_response_queue=asyncio.Queue())
+        handled = await _queue_empty_checkcaptcha_response(agent, Response(), grace_seconds=0)
+        queued = await asyncio.wait_for(agent._captcha_response_queue.get(), timeout=0.1)
+        return handled, queued
 
-    handled = asyncio.run(_queue_empty_checkcaptcha_response(agent, Response()))
-    queued = agent._captcha_response_queue.get_nowait()
+    handled, queued = asyncio.run(scenario())
 
     assert handled is True
     assert queued.is_pass is False
     assert queued.error == "empty_checkcaptcha_response"
+
+
+def test_nonempty_checkcaptcha_response_cancels_pending_failure():
+    class EmptyResponse:
+        url = "https://api.hcaptcha.com/checkcaptcha/example"
+        status = 200
+
+        @staticmethod
+        async def body():
+            return b""
+
+    class ValidResponse(EmptyResponse):
+        @staticmethod
+        async def body():
+            return b'{"pass": true}'
+
+    async def scenario():
+        agent = SimpleNamespace(_captcha_response_queue=asyncio.Queue())
+        assert await _queue_empty_checkcaptcha_response(agent, EmptyResponse(), grace_seconds=0.01)
+        assert not await _queue_empty_checkcaptcha_response(agent, ValidResponse())
+        await asyncio.sleep(0.02)
+        return agent._captcha_response_queue.empty()
+
+    assert asyncio.run(scenario()) is True

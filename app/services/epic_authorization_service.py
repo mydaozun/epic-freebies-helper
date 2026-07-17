@@ -593,7 +593,8 @@ class EpicAuthorization:
     async def invoke(self) -> bool:
         self.page.on("response", self._on_response_anything)
 
-        for attempt in range(1, 4):
+        max_attempts = settings.AUTH_MAX_ATTEMPTS
+        for attempt in range(1, max_attempts + 1):
             await self._goto_claim_page()
 
             if self._needs_privacy_policy_correction():
@@ -616,13 +617,15 @@ class EpicAuthorization:
                 logger.error("Authentication aborted because Epic 2FA is still enabled")
                 return False
 
-            if attempt < 3:
+            if attempt < max_attempts:
                 logger.warning(
-                    "Authentication attempt {}/3 failed; resetting page state before retry", attempt
+                    "Authentication attempt {}/{} failed; resetting page state before retry",
+                    attempt,
+                    max_attempts,
                 )
                 with suppress(Exception):
                     await self.page.context.clear_cookies()
                 await self._replace_page()
 
-        logger.error("Epic Games authentication failed after 3 attempts")
+        logger.error("Epic Games authentication failed after {} attempts", max_attempts)
         return False

@@ -1236,7 +1236,10 @@ class _GLMAsyncModels:
             "Content-Type": "application/json",
         }
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=30.0)) as client:
+        request_timeout = float(self._settings.GLM_REQUEST_TIMEOUT_SECONDS)
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(request_timeout, connect=min(30.0, request_timeout))
+        ) as client:
             response = await client.post(endpoint, headers=headers, json=payload)
             if response.is_error:
                 self._log_glm_error(response)

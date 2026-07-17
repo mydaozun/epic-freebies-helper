@@ -14,6 +14,9 @@ from loguru import logger
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 
+_EMPTY_CHECKCAPTCHA_GRACE_SECONDS = 5.0
+
+
 def _longest_contiguous_run(values: np.ndarray) -> list[int]:
     runs: list[list[int]] = []
     for value in values.tolist():
@@ -209,6 +212,144 @@ def _match_outline_contours(
     return list(best), assigned_scores
 
 
+def _marker_segment_color(
+    image: np.ndarray, center: tuple[int, int]
+) -> tuple[float, float, float] | None:
+    x, y = center
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    yy, xx = np.ogrid[: image.shape[0], : image.shape[1]]
+    distance_squared = (xx - x) ** 2 + (yy - y) ** 2
+    scale = image.shape[1] / 500.0
+    inner_radius = max(5, int(round(8 * scale)))
+    outer_radius = max(15, int(round(25 * scale)))
+    annulus = (distance_squared >= inner_radius**2) & (distance_squared <= outer_radius**2)
+    pixels = image[annulus]
+    hsv_pixels = hsv[annulus]
+    if not len(pixels):
+        return None
+
+    bright_threshold = np.percentile(hsv_pixels[:, 2], 65)
+    line_pixels = pixels[(hsv_pixels[:, 2] > bright_threshold) & (hsv_pixels[:, 1] > 20)]
+    if len(line_pixels) < 20:
+        return None
+    blue, green, red = np.median(line_pixels, axis=0)
+    return float(blue), float(green), float(red)
+
+
+def _select_line_gap_markers(
+    markers: list[tuple[tuple[float, float], tuple[float, float, float]]],
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    if not 4 <= len(markers) <= 7:
+        return None
+
+    # Segment 3 is cyan and segment 5 is yellow across the observed line-puzzle variants.
+    yellow_scores = [red + green - 2 * blue for _, (blue, green, red) in markers]
+    yellow_order = sorted(range(len(markers)), key=yellow_scores.__getitem__, reverse=True)
+    if yellow_scores[yellow_order[0]] - yellow_scores[yellow_order[1]] < 35:
+        return None
+    marker_five_index = yellow_order[0]
+
+    remaining = [index for index in range(len(markers)) if index != marker_five_index]
+    cyan_scores = {
+        index: markers[index][1][0] + markers[index][1][1] - 2 * markers[index][1][2]
+        for index in remaining
+    }
+    cyan_order = sorted(remaining, key=cyan_scores.__getitem__, reverse=True)
+    if cyan_scores[cyan_order[0]] - cyan_scores[cyan_order[1]] < 10:
+        return None
+
+    return markers[cyan_order[0]][0], markers[marker_five_index][0]
+
+
+def _extract_line_target(challenge_screenshot: Path) -> tuple[float, float] | None:
+    image = cv2.imread(str(challenge_screenshot))
+    canvas_origin = _detect_task_canvas_origin(challenge_screenshot)
+    if image is None or canvas_origin is None:
+        return None
+
+    origin_x, origin_y = canvas_origin
+    task_width = image.shape[1] - origin_x
+    fixed_line_width = int(task_width * 0.78)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    fixed_line = gray[origin_y:, origin_x : origin_x + fixed_line_width]
+    scale = image.shape[1] / 500.0
+    circles = cv2.HoughCircles(
+        cv2.GaussianBlur(fixed_line, (5, 5), 1),
+        cv2.HOUGH_GRADIENT,
+        dp=1,
+        minDist=max(18, int(round(25 * scale))),
+        param1=80,
+        param2=18,
+        minRadius=max(5, int(round(7 * scale))),
+        maxRadius=max(10, int(round(14 * scale))),
+    )
+    if circles is None:
+        return None
+
+    markers = []
+    for local_x, local_y, _ in np.round(circles[0]).astype(int):
+        center = (int(local_x + origin_x), int(local_y + origin_y))
+        color = _marker_segment_color(image, center)
+        if color is not None:
+            markers.append((center, color))
+
+    selected = _select_line_gap_markers(markers)
+    if selected is None:
+        return None
+    marker_three, marker_five = selected
+    return (
+        (marker_three[0] + marker_five[0]) / 2 - origin_x,
+        (marker_three[1] + marker_five[1]) / 2 - origin_y,
+    )
+
+
+def _is_line_completion_question(question: str) -> bool:
+    normalized = question.lower()
+    return "segment" in normalized and "line" in normalized
+
+
+def _resolve_line_path(
+    *,
+    captcha_payload: Any,
+    crumb_id: int,
+    challenge_screenshot: Path,
+    challenge_bbox: dict[str, float] | None,
+) -> list[SpatialPath] | None:
+    question = ""
+    with suppress(Exception):
+        question = captcha_payload.get_requester_question()
+    if not _is_line_completion_question(question):
+        return None
+
+    source_points = _payload_source_points(
+        captcha_payload=captcha_payload,
+        crumb_id=crumb_id,
+        challenge_screenshot=challenge_screenshot,
+        challenge_bbox=challenge_bbox,
+    )
+    target = _extract_line_target(challenge_screenshot)
+    if len(source_points) != 1 or target is None:
+        logger.warning("Could not resolve numbered hCaptcha line locally; falling back to LLM")
+        return None
+
+    target_points = _map_canvas_points_to_page(
+        [target], challenge_screenshot=challenge_screenshot, challenge_bbox=challenge_bbox
+    )
+    if len(target_points) != 1:
+        return None
+
+    path = SpatialPath(
+        start_point=PointCoordinate(x=source_points[0][0], y=source_points[0][1]),
+        end_point=PointCoordinate(x=target_points[0][0], y=target_points[0][1]),
+    )
+    logger.info(
+        "Resolved numbered hCaptcha line locally | from={} to={}",
+        (path.start_point.x, path.start_point.y),
+        (path.end_point.x, path.end_point.y),
+    )
+    return [path]
+
+
 async def _resolve_outline_paths(
     *,
     captcha_payload: Any,
@@ -293,7 +434,7 @@ def _build_drag_prompt(user_prompt: str, *, source_points: list[tuple[int, int]]
         f"Authoritative draggable centers from the challenge payload: {source_points}. "
         "Use these exact start_point values and reason only about each end_point."
     )
-    if "complete the line" in user_prompt.lower():
+    if _is_line_completion_question(user_prompt):
         details += (
             " For numbered line completion, locate fixed segments 3 and 5 and the two exposed "
             "ends they present. Translate the entire segment 4 between them. Its end_point is "
@@ -304,18 +445,42 @@ def _build_drag_prompt(user_prompt: str, *, source_points: list[tuple[int, int]]
     return f"{user_prompt}\n\n{details}"
 
 
-async def _queue_empty_checkcaptcha_response(agent: Any, response: Any) -> bool:
+def _cancel_pending_empty_response(agent: Any) -> None:
+    pending = getattr(agent, "_epic_empty_response_task", None)
+    if pending is not None and not pending.done():
+        pending.cancel()
+    agent._epic_empty_response_task = None
+
+
+async def _queue_empty_checkcaptcha_response(
+    agent: Any, response: Any, *, grace_seconds: float = _EMPTY_CHECKCAPTCHA_GRACE_SECONDS
+) -> bool:
     if "/checkcaptcha/" not in str(getattr(response, "url", "")):
         return False
     body = await response.body()
     if body and body.strip():
+        _cancel_pending_empty_response(agent)
         return False
 
-    agent._captcha_response_queue.put_nowait(
-        CaptchaResponse.model_validate({"pass": False, "error": "empty_checkcaptcha_response"})
-    )
+    _cancel_pending_empty_response(agent)
+
+    async def enqueue_failure_after_grace_period():
+        try:
+            await asyncio.sleep(grace_seconds)
+            if agent._captcha_response_queue.empty():
+                agent._captcha_response_queue.put_nowait(
+                    CaptchaResponse.model_validate(
+                        {"pass": False, "error": "empty_checkcaptcha_response"}
+                    )
+                )
+        except asyncio.CancelledError:
+            return
+
+    agent._epic_empty_response_task = asyncio.create_task(enqueue_failure_after_grace_period())
     logger.warning(
-        "hCaptcha check returned an empty response; requesting a fresh challenge | status={}",
+        "hCaptcha check returned an empty response; waiting {:.1f}s for the paired result | "
+        "status={}",
+        grace_seconds,
         getattr(response, "status", "unknown"),
     )
     return True
@@ -354,12 +519,19 @@ def apply_hcaptcha_drag_patch() -> None:
                 "//div[@class='challenge-view']"
             ).bounding_box()
             user_prompt = self._match_user_prompt(job_type)
-            paths = await _resolve_outline_paths(
+            paths = _resolve_line_path(
                 captcha_payload=self.captcha_payload,
                 crumb_id=cid,
                 challenge_screenshot=raw,
                 challenge_bbox=challenge_bbox,
             )
+            if paths is None:
+                paths = await _resolve_outline_paths(
+                    captcha_payload=self.captcha_payload,
+                    crumb_id=cid,
+                    challenge_screenshot=raw,
+                    challenge_bbox=challenge_bbox,
+                )
             if paths is None:
                 source_points = _payload_source_points(
                     captcha_payload=self.captcha_payload,
@@ -395,4 +567,4 @@ def apply_hcaptcha_drag_patch() -> None:
 
     patched_challenge_image_drag_drop._epic_drag_source_patch = True
     RoboticArm.challenge_image_drag_drop = patched_challenge_image_drag_drop
-    logger.info("hCaptcha drag topology and response patches loaded")
+    logger.info("hCaptcha local drag solvers and response patches loaded")
