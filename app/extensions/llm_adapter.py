@@ -78,9 +78,13 @@ GLM_COMPLEX_DRAG_INSTRUCTION = (
     "outlined destinations, then pair each piece with its exact matching silhouette by shape, "
     "color, size, and orientation; do not pair objects merely because they share a row. For "
     "line-completion puzzles, follow the numbered endpoints in order and match each movable "
-    "segment by shape, color, and orientation. Always use the center of the movable piece as "
-    "start_point and the center of its intended outline or gap as end_point. Output only the "
-    "response schema fields challenge_prompt and paths; do not use aliases such as answer or src."
+    "segment by shape, color, and orientation. A movable segment labeled N belongs in the empty "
+    "space between the fixed N-1 and N+1 segments. Infer the final placement by translating the "
+    "whole segment until both ends connect; end_point is the center of the segment at that final "
+    "placement, never the coordinate of a numbered marker or an existing endpoint. Always use "
+    "the center of the movable piece as start_point and the center of its intended outline or "
+    "gap as end_point. Output only the response schema fields challenge_prompt and paths; do not "
+    "use aliases such as answer or src."
 )
 
 GLM_MULTI_TARGET_INSTRUCTION = (

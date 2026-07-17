@@ -823,3 +823,21 @@
   - 密码表单恢复改用 `Locator.wait_for(state="visible")`，避免不兼容的 `is_visible(timeout=...)`；重新提交后会先等待登录结果，只有新 hCaptcha 出现时才进入下一次 solve，保留原有三轮预算。
   - `epic-runtime` 产物同时上传 `.challenge` 隐藏目录，后续失败运行可以直接复核挑战原图和模型缓存；领取多轮复核与 Actions 30 分钟限制均未修改。
   - 按仓库规则未执行测试；提交前只执行格式化、Ruff、`py_compile`、workflow YAML 解析和 `git diff --check` 静态校验。
+
+### 2026-07-17 本地 Camoufox 端到端复测与编号线段题目标修正
+
+- 现象：
+  - 按用户要求使用本地真实 Epic 账号和 GLM `glm-4.6v` 复测时，普通 Playwright Firefox 能进入登录挑战，但 hCaptcha `/checkcaptcha/` 持续返回空响应并刷新题目。
+  - 保存的挑战原图显示，GLM 在线段补全题中把可移动编号 `4` 线段的目标中心选在了已有编号 `3` 端点上，没有推断整段线条在 `3` 与 `5` 之间的最终落位。
+  - 本机 Camoufox 启动器访问 GitHub Releases API 时触发 403 速率限制，无法自动获取浏览器二进制。
+- 根因判断：
+  - 普通 Playwright Firefox 的空校验响应属于本地浏览器环境差异，不能代表 GitHub Actions 默认使用的 Camoufox 路径。
+  - 现有提示要求匹配编号和方向，但没有明确区分“连接端点”与“整段平移后的中心目标坐标”，模型容易直接返回已有编号标记的位置。
+  - Camoufox 二进制可以从官方 release 资源直链下载，403 只发生在未认证 GitHub API 元数据请求。
+- 改动文件：
+  - `app/extensions/llm_adapter.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 编号线段题提示明确要求：编号 `N` 的可移动线段放入固定 `N-1` 与 `N+1` 之间，按两端连接关系推断整段最终位置；`end_point` 必须是最终落位后的线段中心，不能使用已有编号标记或端点坐标。
+  - 本机安装兼容版本 Camoufox 后，以 `BROWSER_BACKEND=camoufox` 完成真实端到端运行，程序确认 Epic 会话有效、查询到两款本周周免、通过订单历史确认均已入库，并正常清理浏览器和以 exit code 0 退出。
+  - 因该账号两款本周周免都已拥有，本次端到端运行按设计在订单预检阶段结束，无法重复触发真实 checkout 提交；登录、周免查询、订单核对和任务正常收口均已实测成功。
